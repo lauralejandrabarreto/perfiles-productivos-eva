@@ -1,0 +1,292 @@
+---
+title: "Perfiles productivos municipales en Colombia: k-medias vs k-medoides"
+subtitle: "Evaluaciones Agropecuarias Municipales (EVA) 2025 - UPRA"
+author: "Nombres del grupo"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    toc: true
+    theme: flatly
+    code_folding: show
+---
+
+## 1. Contexto y objetivo
+
+Los datos provienen de las Evaluaciones Agropecuarias Municipales (EVA), base agrícola 2019-2025, publicadas por la UPRA en datos.gov.co (código `uejq-wxrr`). El objetivo es agrupar los municipios de Colombia según su perfil productivo (tamaño, diversidad y composición del área sembrada) con **k-medias** y **k-medoides (PAM)**, y comparar ambos métodos.
+
+Se trabaja solo con **2025** porque desde 2022 cambió la definición de área cosechada, producción y rendimiento de los cultivos transitorios, y mezclar años anteriores generaría incoherencias.
+
+## 2. Librerías
+
+```{r libs, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+library(kableExtra)
+library(reshape2)
+```
+
+## 3. Lectura y limpieza
+
+El CSV usa punto como separador de miles y coma como decimal (`1.007,00`), por eso se define la configuración regional.
+
+```{r carga, message=FALSE, warning=FALSE}
+# Busca el CSV en la misma carpeta del .Rmd, sin depender del nombre exacto
+archivo <- list.files(pattern = "Evaluaciones.*EVA.*\\.csv$", ignore.case = TRUE)[1]
+stopifnot(!is.na(archivo))
+archivo
+
+eva <- read_csv(archivo,
+                locale = locale(decimal_mark = ",", grouping_mark = ".", encoding = "UTF-8"),
+                show_col_types = FALSE)
+
+# Renombrar por posición para evitar problemas con tildes y espacios
+names(eva) <- c("cod_dep","dep","cod_mun","mun","grupo","subgrupo","cultivo","desag",
+                "anio","periodo","sembrada","cosechada","prod","rend","ciclo",
+                "estado","cod_cultivo","cientifico")
+
+dim(eva)
+glimpse(eva)
+```
+
+## 4. Construcción de la matriz municipal (2025)
+
+Cada fila es un municipio. Variables cuantitativas:
+
+- `log_area`: logaritmo del área sembrada total (ha). El logaritmo corrige la fuerte asimetría.
+- `n_cultivos`: número de cultivos distintos.
+- `pct_perm`: proporción del área en cultivos permanentes.
+- `pct_cereales`, `pct_frutales`, `pct_tropicales`, `pct_raices`, `pct_hortalizas`: proporción del área por grupo de cultivo.
+
+```{r matriz}
+d25 <- eva %>% filter(anio == 2025)
+
+base <- d25 %>%
+  group_by(cod_mun, mun, dep) %>%
+  summarise(area_total = sum(sembrada),
+            n_cultivos = n_distinct(cultivo),
+            area_perm  = sum(sembrada[ciclo == "Permanente"]),
+            .groups = "drop")
+
+grupos <- d25 %>%
+  mutate(g = case_when(
+    grupo == "Cereales" ~ "cereales",
+    grupo == "Frutales" ~ "frutales",
+    grupo == "Cultivos tropicales tradicionales" ~ "tropicales",
+    grupo == "Raíces y tubérculos" ~ "raices",
+    grupo == "Hortalizas" ~ "hortalizas",
+    TRUE ~ "otros")) %>%
+  group_by(cod_mun, g) %>%
+  summarise(a = sum(sembrada), .groups = "drop") %>%
+  pivot_wider(names_from = g, values_from = a, values_fill = 0)
+
+mun <- base %>%
+  left_join(grupos, by = "cod_mun") %>%
+  filter(area_total > 0) %>%
+  mutate(log_area       = log(area_total),
+         pct_perm       = area_perm / area_total,
+         pct_cereales   = cereales / area_total,
+         pct_frutales   = frutales / area_total,
+         pct_tropicales = tropicales / area_total,
+         pct_raices     = raices / area_total,
+         pct_hortalizas = hortalizas / area_total)
+
+vars <- c("log_area","n_cultivos","pct_perm","pct_cereales",
+          "pct_frutales","pct_tropicales","pct_raices","pct_hortalizas")
+
+df <- as.data.frame(mun[, vars])
+rownames(df) <- mun$cod_mun
+nrow(df)
+```
+
+## 5. Análisis exploratorio
+
+```{r eda-resumen}
+summary(df) %>% kable() %>% kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+Efecto del logaritmo sobre el área total:
+
+```{r eda-log, fig.width=9, fig.height=4}
+par(mfrow = c(1, 2))
+hist(mun$area_total, breaks = 50, main = "Área total (ha)", xlab = "", col = "grey80")
+hist(mun$log_area,   breaks = 50, main = "Log del área total", xlab = "", col = "steelblue")
+par(mfrow = c(1, 1))
+```
+
+```{r eda-cor, fig.width=7, fig.height=6}
+corr <- melt(cor(df))
+ggplot(corr, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(low = "lightblue", mid = "#ECF0F1", high = "red3",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Matriz de correlación", x = "", y = "")
+```
+
+## 6. Estandarización
+
+Se estandarizan todas las variables (media 0, desviación 1) para que ninguna domine la distancia.
+
+```{r escala}
+df_z <- scale(df)
+```
+
+## 7. Número de grupos
+
+```{r elegir-k, fig.width=10, fig.height=4}
+set.seed(2026)
+p1 <- fviz_nbclust(df_z, kmeans, method = "wss") + ggtitle("Codo (k-medias)")
+p2 <- fviz_nbclust(df_z, kmeans, method = "silhouette") + ggtitle("Silueta (k-medias)")
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+```{r elegir-k-pam, fig.width=10, fig.height=4}
+p3 <- fviz_nbclust(df_z, pam, method = "silhouette") + ggtitle("Silueta (PAM)")
+# El estadístico Gap con PAM es lento; se limita k máximo y remuestreos
+# p4 <- fviz_nbclust(df_z, pam, method = "gap_stat", nboot = 30, k.max = 8)
+p3
+```
+
+Elegir `k` combinando las métricas con la interpretabilidad de los grupos. Ajustar `k` en la celda siguiente.
+
+## 8. k-medias
+
+```{r kmeans}
+k <- 4
+set.seed(2026)
+km <- kmeans(df_z, centers = k, nstart = 50)
+table(km$cluster)
+```
+
+```{r kmeans-plot, fig.width=8, fig.height=6}
+fviz_cluster(km, data = df_z, geom = "point", ellipse.type = "norm",
+             palette = "Set1", ggtheme = theme_minimal(),
+             main = paste("k-medias, k =", k))
+```
+
+## 9. k-medoides (PAM)
+
+```{r pam}
+pam_res <- pam(df_z, k = k, metric = "manhattan")
+table(pam_res$clustering)
+```
+
+Los medoides son municipios reales que representan a cada grupo:
+
+```{r medoides}
+id_med <- as.numeric(rownames(df)[pam_res$id.med])
+mun %>%
+  filter(cod_mun %in% id_med) %>%
+  mutate(cluster = match(cod_mun, id_med)) %>%
+  select(cluster, dep, mun, area_total, n_cultivos, pct_perm) %>%
+  arrange(cluster) %>%
+  kable(digits = 2) %>% kable_styling(bootstrap_options = "striped")
+```
+
+```{r pam-plot, fig.width=8, fig.height=6}
+fviz_cluster(pam_res, geom = "point", ellipse.type = "convex",
+             palette = "Set1", ggtheme = theme_minimal(),
+             main = paste("k-medoides (PAM), k =", k))
+```
+
+## 10. Comparación de métodos
+
+```{r silueta}
+sil_km  <- silhouette(km$cluster, dist(df_z))
+sil_pam <- silhouette(pam_res$clustering, dist(df_z))
+
+data.frame(Método = c("k-medias", "k-medoides"),
+           `Silueta media` = c(mean(sil_km[, 3]), mean(sil_pam[, 3])),
+           check.names = FALSE) %>%
+  kable(digits = 3) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+Tabla de correspondencia entre ambos métodos (qué tanto coinciden las asignaciones):
+
+```{r cruce}
+table(kmedias = km$cluster, kmedoides = pam_res$clustering)
+```
+
+```{r silueta-plot, fig.width=9, fig.height=4}
+p_a <- fviz_silhouette(sil_km)  + ggtitle("Silueta: k-medias")
+p_b <- fviz_silhouette(sil_pam) + ggtitle("Silueta: k-medoides")
+gridExtra::grid.arrange(p_a, p_b, ncol = 2)
+```
+
+## 11. Caracterización de los grupos
+
+Perfiles en unidades originales (usando la partición de k-medias; repetir con PAM si se desea):
+
+```{r perfiles}
+mun$cluster_km  <- factor(km$cluster)
+mun$cluster_pam <- factor(pam_res$clustering)
+
+mun %>%
+  group_by(cluster_km) %>%
+  summarise(n = n(),
+            area_mediana = median(area_total),
+            n_cultivos   = mean(n_cultivos),
+            pct_perm     = mean(pct_perm),
+            pct_cereales = mean(pct_cereales),
+            pct_frutales = mean(pct_frutales),
+            pct_tropicales = mean(pct_tropicales),
+            pct_raices   = mean(pct_raices),
+            pct_hortalizas = mean(pct_hortalizas)) %>%
+  kable(digits = 2, caption = "Perfil promedio por grupo (k-medias)") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+```{r centros-z, fig.width=9, fig.height=5}
+centros <- as.data.frame(km$centers) %>%
+  mutate(cluster = factor(1:k)) %>%
+  pivot_longer(-cluster, names_to = "variable", values_to = "z")
+
+ggplot(centros, aes(variable, z, fill = cluster)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(title = "Centros de los grupos (z-score)", x = "", y = "Z")
+```
+
+Ver los grupos por departamento:
+
+```{r por-dep}
+mun %>%
+  count(dep, cluster_km) %>%
+  pivot_wider(names_from = cluster_km, values_from = n, values_fill = 0) %>%
+  arrange(desc(rowSums(across(where(is.numeric))))) %>%
+  head(15) %>%
+  kable(caption = "Municipios por grupo en los 15 departamentos con más municipios") %>%
+  kable_styling(bootstrap_options = "striped")
+```
+
+## 12. Interpretación y conclusiones
+
+*(Escribir aquí: nombre y descripción de cada perfil, diferencias entre k-medias y k-medoides, limitaciones de los datos y lectura para política agropecuaria.)*
+
+## 13. Limitaciones
+
+- Los datos son reportados por los municipios y conciliados por la UPRA; no son mediciones directas.
+- Las cifras de los últimos años pueden ajustarse.
+- El análisis usa un solo año (2025), por lo que no captura dinámica temporal.
+- El área es acumulada anual: permanentes más ambos semestres de los transitorios.
+
+## Referencias
+
+Kaufman, L. y Rousseeuw, P. (1990). *Finding Groups in Data*. Wiley.
+
+MacQueen, J. (1967). Some methods for classification and analysis of multivariate observations.
+
+Rousseeuw, P. (1987). Silhouettes: a graphical aid to the interpretation and validation of cluster analysis. *Journal of Computational and Applied Mathematics*, 20.
+
+Tibshirani, R., Walther, G. y Hastie, T. (2001). Estimating the number of clusters in a data set via the gap statistic. *JRSS B*, 63(2).
+
+UPRA. Evaluaciones Agropecuarias Municipales (EVA) 2019-2025. Base Agrícola. datos.gov.co.

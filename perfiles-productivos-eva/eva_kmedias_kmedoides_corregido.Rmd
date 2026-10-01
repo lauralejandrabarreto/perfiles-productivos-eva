@@ -1,0 +1,530 @@
+---
+title: "Perfiles productivos municipales en Colombia: k-medias vs k-medoides"
+subtitle: "Evaluaciones Agropecuarias Municipales (EVA) 2025 - UPRA"
+author: "Pinzón Esteban, Barreto Alejandra"
+date: '`r format(Sys.time(), "%d %B, %Y")`'
+output:
+  html_document:
+    toc: true
+    theme: flatly
+    code_folding: show
+---
+
+<!--
+  VERSIÓN CORREGIDA TRAS LA AUDITORÍA.
+  Todo lo nuevo o modificado está marcado con  ">>> NUEVO"  o  ">>> CORREGIDO"
+  dentro de los bloques de código. El resto quedó igual que el original.
+-->
+
+## 1. Contexto y objetivo
+
+Los datos provienen de las Evaluaciones Agropecuarias Municipales (EVA), base agrícola 2019-2025, publicadas por la UPRA en datos.gov.co (código `uejq-wxrr`). El objetivo es agrupar los municipios de Colombia según su perfil productivo (tamaño, diversidad y composición del área sembrada) con **k-medias** y **k-medoides (PAM)**, y comparar ambos métodos.
+
+Se trabaja solo con **2025** porque desde 2022 cambió la definición de área cosechada, producción y rendimiento de los cultivos transitorios, y mezclar años anteriores generaría incoherencias.
+
+## 2. Librerías
+
+```{r libs, message=FALSE, warning=FALSE}
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+library(kableExtra)
+library(reshape2)
+library(gridExtra)
+```
+
+## 3. Lectura y limpieza
+
+El CSV usa punto como separador de miles y coma como decimal (`1.007,00`), por eso se define la configuración regional.
+
+```{r carga, message=FALSE, warning=FALSE}
+# Busca el CSV en la misma carpeta del .Rmd, sin depender del nombre exacto
+archivo <- list.files(pattern = "Evaluaciones.*EVA.*\\.csv$", ignore.case = TRUE)[1]
+stopifnot(!is.na(archivo))
+archivo
+
+eva <- read_csv(archivo,
+                locale = locale(decimal_mark = ",", grouping_mark = ".", encoding = "UTF-8"),
+                show_col_types = FALSE)
+
+# Renombrar por posición para evitar problemas con tildes y espacios
+names(eva) <- c("cod_dep","dep","cod_mun","mun","grupo","subgrupo","cultivo","desag",
+                "anio","periodo","sembrada","cosechada","prod","rend","ciclo",
+                "estado","cod_cultivo","cientifico")
+
+dim(eva)
+glimpse(eva)
+```
+
+### 3.1 Revisión de la lectura y de los valores faltantes
+
+```{r revision-datos}
+# >>> NUEVO: problemas de lectura (debe salir una tabla vacía)
+problems(eva)
+
+# >>> NUEVO: conteos que cita el reporte (1.103 municipios, 32 departamentos, 165 cultivos)
+data.frame(municipios    = n_distinct(eva$cod_mun),
+           departamentos = n_distinct(eva$cod_dep),
+           cultivos      = n_distinct(eva$cultivo))
+
+# >>> NUEVO: valores faltantes en 2025 (si 'sembrada' tiene NA, hay que decidir qué hacer)
+d25_check <- eva %>% filter(anio == 2025)
+colSums(is.na(d25_check[, c("sembrada", "ciclo", "grupo", "cultivo")]))
+
+# >>> NUEVO: municipio(s) que están en el archivo pero no tienen datos en 2025
+eva %>% filter(!cod_mun %in% d25_check$cod_mun) %>% distinct(cod_dep, dep, cod_mun, mun)
+
+# >>> NUEVO: área sembrada total 2025 por ciclo (reporte: 3,45 M permanentes y 2,15 M transitorios)
+d25_check %>%
+  group_by(ciclo) %>%
+  summarise(hectareas = sum(sembrada, na.rm = TRUE)) %>%
+  bind_rows(tibble(ciclo = "TOTAL", hectareas = sum(d25_check$sembrada, na.rm = TRUE)))
+```
+
+## 4. Construcción de la matriz municipal (2025)
+
+Cada fila es un municipio. Variables cuantitativas:
+
+- `log_area`: logaritmo del área sembrada total (ha). El logaritmo corrige la fuerte asimetría.
+- `n_cultivos`: número de cultivos distintos.
+- `pct_perm`: proporción del área en cultivos permanentes.
+- `pct_cereales`, `pct_frutales`, `pct_tropicales`, `pct_raices`, `pct_hortalizas`: proporción del área por grupo de cultivo.
+
+```{r matriz}
+d25 <- eva %>% filter(anio == 2025)
+
+base <- d25 %>%
+  group_by(cod_mun, mun, dep) %>%
+  summarise(area_total = sum(sembrada),
+            n_cultivos = n_distinct(cultivo),
+            area_perm  = sum(sembrada[ciclo == "Permanente"]),
+            .groups = "drop")
+
+grupos <- d25 %>%
+  mutate(g = case_when(
+    grupo == "Cereales" ~ "cereales",
+    grupo == "Frutales" ~ "frutales",
+    grupo == "Cultivos tropicales tradicionales" ~ "tropicales",
+    grupo == "Raíces y tubérculos" ~ "raices",
+    grupo == "Hortalizas" ~ "hortalizas",
+    TRUE ~ "otros")) %>%
+  group_by(cod_mun, g) %>%
+  summarise(a = sum(sembrada), .groups = "drop") %>%
+  pivot_wider(names_from = g, values_from = a, values_fill = 0)
+
+# >>> NUEVO: avisa si algún municipio quedaría con área NA (se perdería en silencio en el filtro)
+sum(is.na(base$area_total))
+
+mun <- base %>%
+  left_join(grupos, by = "cod_mun") %>%
+  filter(area_total > 0) %>%
+  mutate(log_area       = log(area_total),
+         pct_perm       = area_perm / area_total,
+         pct_cereales   = cereales / area_total,
+         pct_frutales   = frutales / area_total,
+         pct_tropicales = tropicales / area_total,
+         pct_raices     = raices / area_total,
+         pct_hortalizas = hortalizas / area_total)
+
+vars <- c("log_area","n_cultivos","pct_perm","pct_cereales",
+          "pct_frutales","pct_tropicales","pct_raices","pct_hortalizas")
+
+df <- as.data.frame(mun[, vars])
+rownames(df) <- mun$cod_mun
+nrow(df)
+```
+
+## 5. Análisis exploratorio
+
+```{r eda-resumen}
+summary(df) %>% kable() %>% kable_styling(bootstrap_options = c("striped","condensed"))
+```
+
+```{r eda-tabla1}
+# >>> NUEVO: media y desviación estándar de la Tabla 1 del reporte
+data.frame(Variable = vars,
+           Media    = sapply(df, mean),
+           Desv_est = sapply(df, sd)) %>%
+  kable(digits = 2, row.names = FALSE, caption = "Tabla 1: media y desviación estándar") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+```
+
+Efecto del logaritmo sobre el área total:
+
+```{r eda-log, fig.width=9, fig.height=4}
+par(mfrow = c(1, 2))
+hist(mun$area_total, breaks = 50, main = "Área total (ha)", xlab = "", col = "grey80")
+hist(mun$log_area,   breaks = 50, main = "Log del área total", xlab = "", col = "steelblue")
+par(mfrow = c(1, 1))
+```
+
+```{r eda-asimetria}
+# >>> NUEVO: asimetría antes y después del logaritmo (reporte: 12,0 y -0,5)
+asim <- function(x) { x <- x - mean(x); mean(x^3) / mean(x^2)^1.5 }
+data.frame(Variable  = c("area_total", "log_area"),
+           Asimetria = c(asim(mun$area_total), asim(mun$log_area)),
+           Mediana   = c(median(mun$area_total), median(mun$log_area))) %>%
+  kable(digits = 2)
+
+# >>> NUEVO: municipio con mayor área sembrada (reporte: Puerto Gaitán)
+mun %>% slice_max(area_total, n = 1) %>% select(dep, mun, area_total)
+```
+
+```{r eda-cor, fig.width=7, fig.height=6}
+corr <- melt(cor(df))
+ggplot(corr, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 3) +
+  scale_fill_gradient2(low = "lightblue", mid = "#ECF0F1", high = "red3",
+                       midpoint = 0, limits = c(-1, 1)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Matriz de correlación", x = "", y = "")
+```
+
+## 6. Estandarización
+
+Se estandarizan todas las variables (media 0, desviación 1) para que ninguna domine la distancia.
+
+```{r escala}
+df_z <- scale(df)
+```
+
+### 6.1 Valores atípicos
+
+```{r atipicos}
+# >>> NUEVO: municipios con algún valor a más de 4 desviaciones de la media
+z_max <- apply(abs(df_z), 1, max)
+atip  <- names(z_max[z_max > 4])
+length(atip)
+mun %>%
+  filter(cod_mun %in% atip) %>%
+  select(dep, mun, area_total, n_cultivos, pct_perm, pct_hortalizas) %>%
+  kable(digits = 2, caption = "Municipios con valores extremos (|z| > 4)") %>%
+  kable_styling(bootstrap_options = "striped")
+```
+
+## 7. Número de grupos
+
+```{r elegir-k, fig.width=10, fig.height=4}
+# >>> CORREGIDO: antes se usaba fviz_nbclust, que corre k-medias con UNA sola
+# inicialización y PAM con distancia euclidiana (distinto al PAM final con Manhattan).
+# Ahora se usan exactamente los mismos ajustes que en los modelos finales.
+ks    <- 2:10
+d_euc <- dist(df_z)                        # para la silueta (igual que en la sección 10)
+d_man <- dist(df_z, method = "manhattan")  # para PAM
+
+tabla_k <- bind_rows(lapply(ks, function(kk) {
+  set.seed(2026)
+  km_k  <- kmeans(df_z, centers = kk, nstart = 50, iter.max = 50)
+  pam_k <- pam(d_man, k = kk, diss = TRUE)
+  data.frame(k           = kk,
+             inercia     = km_k$tot.withinss,
+             sil_kmedias = mean(silhouette(km_k$cluster, d_euc)[, 3]),
+             sil_pam     = mean(silhouette(pam_k$clustering, d_euc)[, 3]),
+             sil_pam_man = pam_k$silinfo$avg.width)
+}))
+
+tabla_k %>%
+  kable(digits = 3, caption = "Tabla 2: inercia y silueta media según k") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+g_codo <- ggplot(tabla_k, aes(k, inercia)) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = 4, linetype = "dotted") +
+  scale_x_continuous(breaks = ks) + theme_minimal() +
+  labs(title = "Codo (k-medias)", y = "Inercia intragrupo")
+
+g_sil <- tabla_k %>%
+  pivot_longer(c(sil_kmedias, sil_pam), names_to = "metodo", values_to = "silueta") %>%
+  mutate(metodo = recode(metodo, sil_kmedias = "k-medias", sil_pam = "k-medoides")) %>%
+  ggplot(aes(k, silueta, color = metodo)) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = 4, linetype = "dotted") +
+  scale_x_continuous(breaks = ks) + theme_minimal() +
+  labs(title = "Silueta media (distancia euclidiana)", y = "Silueta media", color = "")
+
+grid.arrange(g_codo, g_sil, ncol = 2)
+```
+
+```{r k2-k3}
+# >>> NUEVO: qué pasa con k = 2 y k = 3 (justifica la elección de k = 4 en el reporte)
+for (kk in 2:3) {
+  set.seed(2026)
+  km_k <- kmeans(df_z, centers = kk, nstart = 50)
+  cat("\n--- k =", kk, "---\n")
+  print(mun %>%
+          mutate(g = km_k$cluster) %>%
+          group_by(g) %>%
+          summarise(n = n(),
+                    pct_perm   = round(mean(pct_perm), 2),
+                    pct_frut   = round(mean(pct_frutales), 2),
+                    pct_trop   = round(mean(pct_tropicales), 2),
+                    pct_cer    = round(mean(pct_cereales), 2),
+                    pct_raices = round(mean(pct_raices), 2)))
+}
+```
+
+La silueta media es máxima con k = 2, pero esa partición solo separa municipios de cultivos permanentes y de ciclo corto. Con k = 3 se fusionan los perfiles frutícola y tropical tradicional. Se elige **k = 4** como el menor número de grupos que conserva esa distinción, a costa de una silueta menor.
+
+## 8. k-medias
+
+```{r kmeans}
+k <- 4
+set.seed(2026)
+km <- kmeans(df_z, centers = k, nstart = 50)
+table(km$cluster)
+km$tot.withinss   # >>> NUEVO: inercia final (debe coincidir con la Tabla 2 en k = 4)
+```
+
+```{r kmeans-plot, fig.width=8, fig.height=6}
+fviz_cluster(km, data = df_z, geom = "point", ellipse.type = "norm",
+             palette = "Set1", ggtheme = theme_minimal(),
+             main = paste("k-medias, k =", k))
+```
+
+## 9. k-medoides (PAM)
+
+```{r pam}
+pam_res <- pam(df_z, k = k, metric = "manhattan")
+table(pam_res$clustering)
+```
+
+Los medoides son municipios reales que representan a cada grupo:
+
+```{r medoides}
+# >>> CORREGIDO: antes se usaba as.numeric() sobre el código del municipio, que borra
+# el 0 inicial ("05001" -> 5001) y haría desaparecer medoides de Antioquia o Atlántico.
+# Ahora se toman las filas directamente (mun, df y df_z tienen el mismo orden).
+mun[pam_res$id.med, ] %>%
+  mutate(cluster = seq_len(k)) %>%
+  select(cluster, dep, mun, area_total, n_cultivos, pct_perm,
+         pct_cereales, pct_frutales, pct_tropicales, pct_raices) %>%
+  kable(digits = 2) %>% kable_styling(bootstrap_options = "striped")
+```
+
+```{r pam-plot, fig.width=8, fig.height=6}
+fviz_cluster(pam_res, geom = "point", ellipse.type = "convex",
+             palette = "Set1", ggtheme = theme_minimal(),
+             main = paste("k-medoides (PAM), k =", k))
+```
+
+## 10. Comparación de métodos
+
+```{r silueta}
+sil_km  <- silhouette(km$cluster, dist(df_z))
+sil_pam <- silhouette(pam_res$clustering, dist(df_z))
+
+data.frame(Método = c("k-medias", "k-medoides"),
+           `Silueta media` = c(mean(sil_km[, 3]), mean(sil_pam[, 3])),
+           `% silueta negativa` = 100 * c(mean(sil_km[, 3] < 0), mean(sil_pam[, 3] < 0)),  # >>> NUEVO
+           check.names = FALSE) %>%
+  kable(digits = 3) %>% kable_styling(bootstrap_options = "striped", full_width = FALSE)
+
+# >>> NUEVO: silueta de PAM con su propia distancia (Manhattan), como referencia
+pam_res$silinfo$avg.width
+```
+
+Tabla de correspondencia entre ambos métodos (qué tanto coinciden las asignaciones):
+
+```{r cruce}
+table(kmedias = km$cluster, kmedoides = pam_res$clustering)
+
+# >>> NUEVO: índice de Rand ajustado (reporte: 0,667), sin paquetes adicionales
+ari <- function(a, b) {
+  tab <- table(a, b); n <- sum(tab)
+  s   <- sum(choose(tab, 2))
+  sa  <- sum(choose(rowSums(tab), 2))
+  sb  <- sum(choose(colSums(tab), 2))
+  esp <- sa * sb / choose(n, 2)
+  (s - esp) / ((sa + sb) / 2 - esp)
+}
+ari(km$cluster, pam_res$clustering)
+```
+
+```{r silueta-plot, fig.width=9, fig.height=4}
+p_a <- fviz_silhouette(sil_km)  + ggtitle("Silueta: k-medias")
+p_b <- fviz_silhouette(sil_pam) + ggtitle("Silueta: k-medoides")
+grid.arrange(p_a, p_b, ncol = 2)
+```
+
+### 10.1 Sensibilidad a los valores atípicos
+
+```{r sensibilidad}
+# >>> NUEVO: ¿cambia k-medias si se quitan los municipios extremos de la sección 6.1?
+keep <- !rownames(df) %in% atip
+set.seed(2026)
+km_s <- kmeans(scale(df[keep, ]), centers = k, nstart = 50)
+ari(km_s$cluster, km$cluster[keep])   # cercano a 1 = los atípicos casi no influyen
+```
+
+## 11. Caracterización de los grupos
+
+```{r etiquetas}
+# >>> NUEVO: nombre de cada grupo según su tipo de cultivo dominante,
+# para que el mismo perfil tenga el mismo nombre en k-medias y en PAM
+etiquetar <- function(cl) {
+  dom <- mun %>%
+    mutate(cl = cl) %>%
+    group_by(cl) %>%
+    summarise(Frutícola = mean(pct_frutales), Cerealero = mean(pct_cereales),
+              Andino    = mean(pct_raices),   Tropical  = mean(pct_tropicales)) %>%
+    pivot_longer(-cl) %>%
+    group_by(cl) %>%
+    slice_max(value, n = 1, with_ties = FALSE)
+  factor(dom$name[match(cl, dom$cl)],
+         levels = c("Frutícola", "Cerealero", "Andino", "Tropical"))
+}
+mun$cluster_km  <- factor(km$cluster)
+mun$cluster_pam <- factor(pam_res$clustering)
+mun$perfil_km   <- etiquetar(km$cluster)
+mun$perfil_pam  <- etiquetar(pam_res$clustering)
+stopifnot(n_distinct(mun$perfil_km) == 4, n_distinct(mun$perfil_pam) == 4)
+
+table(k_medias = mun$perfil_km, k_medoides = mun$perfil_pam)
+```
+
+Perfiles en unidades originales (partición de k-medias):
+
+```{r perfiles}
+gran_total_nacional <- sum(mun$area_total, na.rm = TRUE)
+mun %>%
+  group_by(perfil_km) %>%
+  summarise(n = n(),
+            pct_area_nacional = 100 * sum(area_total, na.rm = TRUE) / gran_total_nacional,  # >>> NUEVO
+            area_mediana = median(area_total),
+            n_cultivos   = mean(n_cultivos),
+            pct_perm     = mean(pct_perm),
+            pct_cereales = mean(pct_cereales),
+            pct_frutales = mean(pct_frutales),
+            pct_tropicales = mean(pct_tropicales),
+            pct_raices   = mean(pct_raices),
+            pct_hortalizas = mean(pct_hortalizas)) %>%
+  kable(digits = 2, caption = "Perfil promedio por grupo (k-medias)") %>%
+  kable_styling(bootstrap_options = c("striped","hover"))
+```
+
+```{r cultivos-dominantes}
+# >>> NUEVO: los 4 cultivos con más área sembrada dentro de cada grupo (Tabla 3 del reporte)
+d25 %>%
+  inner_join(select(mun, cod_mun, perfil_km), by = "cod_mun") %>%
+  group_by(perfil_km, cultivo) %>%
+  summarise(ha = sum(sembrada, na.rm = TRUE), .groups = "drop_last") %>%
+  mutate(pct = round(100 * ha / sum(ha), 1)) %>%
+  slice_max(pct, n = 4) %>%
+  kable(digits = 1, caption = "Cultivos con más área por grupo (k-medias)") %>%
+  kable_styling(bootstrap_options = "striped")
+```
+
+```{r centros-z, fig.width=9, fig.height=5}
+# >>> CORREGIDO: nombres de perfil en vez de números
+lab_km <- sapply(1:k, function(i) as.character(mun$perfil_km[km$cluster == i][1]))
+centros <- as.data.frame(km$centers) %>%
+  mutate(cluster = factor(lab_km, levels = levels(mun$perfil_km))) %>%
+  pivot_longer(-cluster, names_to = "variable", values_to = "z")
+
+ggplot(centros, aes(variable, z, fill = cluster)) +
+  geom_col(position = "dodge") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal() +
+  labs(title = "Centros de los grupos (z-score)", x = "", y = "Z", fill = "Perfil")
+```
+
+```{r pca}
+# >>> NUEVO: varianza explicada y cargas de los dos primeros componentes principales
+pca <- prcomp(df_z)
+round(100 * summary(pca)$importance[2, 1:2], 1)   # reporte: 37,3 % y 17,6 %
+round(pca$rotation[, 1:2], 2)                      # qué variables pesan en cada componente
+```
+
+```{r fig5-pca, fig.width=10, fig.height=4.5}
+# >>> NUEVO: Figura 5 del reporte en R, con los mismos colores que la Figura 6
+pc <- as.data.frame(pca$x[, 1:2]) %>%
+  mutate(`k-medias` = mun$perfil_km,
+         `k-medoides (PAM)` = mun$perfil_pam) %>%
+  pivot_longer(c(`k-medias`, `k-medoides (PAM)`),
+               names_to = "metodo", values_to = "perfil")
+
+medoides_pc <- as.data.frame(pca$x[pam_res$id.med, 1:2]) %>%
+  mutate(metodo = "k-medoides (PAM)")
+
+ggplot(pc, aes(PC1, PC2, color = perfil)) +
+  geom_point(size = 1, alpha = 0.6) +
+  geom_point(data = medoides_pc, aes(PC1, PC2), inherit.aes = FALSE,
+             shape = 4, size = 4, stroke = 1.5, color = "black") +
+  facet_wrap(~ metodo) +
+  scale_color_brewer(palette = "Set2") +
+  theme_minimal() +
+  labs(x = "Componente principal 1 (37,3 %)",
+       y = "Componente principal 2 (17,6 %)",
+       color = "Perfil")
+```
+
+Ver los grupos por departamento:
+
+```{r por-dep}
+# >>> CORREGIDO: columnas en orden y con nombre, 12 departamentos como en el reporte
+mun %>%
+  count(dep, perfil_km) %>%
+  pivot_wider(names_from = perfil_km, values_from = n, values_fill = 0, names_sort = TRUE) %>%
+  mutate(Total = rowSums(across(where(is.numeric)))) %>%
+  arrange(desc(Total)) %>%
+  head(12) %>%
+  kable(caption = "Municipios por grupo en los 12 departamentos con más municipios") %>%
+  kable_styling(bootstrap_options = "striped")
+
+# >>> NUEVO: verificar La Guajira (reporte: 11 de 15 cerealeros)
+mun %>% filter(dep == "La Guajira") %>% count(perfil_km)
+```
+
+```{r por-dep-plot, fig.width=9, fig.height=5}
+# >>> NUEVO: figura de departamentos (Figura 6 del reporte) generada en R
+top12 <- mun %>% count(dep, sort = TRUE) %>% head(12) %>% pull(dep)
+mun %>%
+  filter(dep %in% top12) %>%
+  count(dep, perfil_km) %>%
+  ggplot(aes(x = reorder(dep, n, sum), y = n, fill = perfil_km)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  labs(x = "", y = "Número de municipios", fill = "Perfil",
+       title = "Grupos de k-medias en los 12 departamentos con más municipios")
+```
+
+## 12. Interpretación y conclusiones
+1. A partir de ocho variables cuantitativas construidas con datos reales de las EVA 2025, los 1.102 municipios se agrupan en cuatro perfiles productivos: tropical tradicional, cerealero de ciclo corto, frutícola permanente y andino de pequeña escala.
+
+2. Ambos métodos identifican esos perfiles. Coinciden en 85,0 % de los municipios (índice de Rand ajustado de 0,667) y difieren sobre todo en los municipios de composición mixta, en particular los frutícolas.
+
+3. La estructura de los grupos es entre débil y no sustancial (silueta media de 0,255 con k-medias y 0,247 con k-medoides), por lo que los perfiles deben leerse como tendencias dominantes y no como categorías cerradas.
+
+4. Ninguno de los dos métodos domina: k-medias asigna menos municipios a un grupo con el que comparten poco, pero su ventaja en compacidad es mínima y depende de la distancia usada para medirla; k-medoides aporta municipios representativos que facilitan la interpretación. La elección depende de si se prioriza la cohesión estadística o la comunicación de los resultados.
+
+5. El trabajo puede mejorarse incorporando las oleaginosas, más de un año de datos y variables territoriales, y probando otros criterios de validación del número de grupos.
+
+## 13. Limitaciones
+
+- Los datos son reportados por los municipios y conciliados por la UPRA; no son mediciones directas.
+- Las cifras de los últimos años pueden ajustarse.
+- El análisis usa un solo año (2025), por lo que no captura dinámica temporal.
+- El área es acumulada anual: permanentes más ambos semestres de los transitorios.
+
+## Referencias
+
+Hartigan, J. A. y Wong, M. A. (1979). Algorithm AS 136: A k-means clustering algorithm. *Applied Statistics*, 28(1), 100-108.
+
+Hubert, L. y Arabie, P. (1985). Comparing partitions. *Journal of Classification*, 2(1), 193-218.
+
+Kaufman, L. y Rousseeuw, P. (1990). *Finding Groups in Data*. Wiley.
+
+MacQueen, J. (1967). Some methods for classification and analysis of multivariate observations.
+
+Rousseeuw, P. (1987). Silhouettes: a graphical aid to the interpretation and validation of cluster analysis. *Journal of Computational and Applied Mathematics*, 20.
+
+UPRA. Evaluaciones Agropecuarias Municipales (EVA) 2019-2025. Base Agrícola. datos.gov.co.

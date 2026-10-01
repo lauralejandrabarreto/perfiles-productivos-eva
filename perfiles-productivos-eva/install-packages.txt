@@ -1,0 +1,4 @@
+
+install.packages(c("readr", "dplyr", "tidyr", "ggplot2", "factoextra",
+                   "kableExtra", "reshape2", "gridExtra", "cluster",
+                   "knitr", "rmarkdown"))

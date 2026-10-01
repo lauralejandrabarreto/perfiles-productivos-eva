@@ -1,0 +1,12 @@
+# Archivos de RStudio
+.Rhistory
+.RData
+.Rproj.user/
+
+# Datos (se descargan de datos.gov.co)
+*.csv
+
+# Archivos temporales
+~$*
+.DS_Store
+Thumbs.db
